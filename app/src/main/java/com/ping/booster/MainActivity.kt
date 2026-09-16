@@ -1,4 +1,4 @@
-package com.ping.keepalive
+package com.ping.booster
 
 import android.Manifest
 import android.content.Context
@@ -31,7 +31,7 @@ class MainActivity : AppCompatActivity() {
         val btnStop: Button = findViewById(R.id.btnStop)
 
         // Load saved settings
-        val prefs = getSharedPreferences("PingPrefs", Context.MODE_PRIVATE)
+        val prefs = getSharedPreferences(PingService.PREFS_NAME, Context.MODE_PRIVATE)
         inputUrl.setText(prefs.getString("url", "https://oneapp.hutch.lk"))
         inputDelay.setText(prefs.getInt("delay", 15).toString())
         updateStatus()
@@ -61,9 +61,8 @@ class MainActivity : AppCompatActivity() {
             // Start Service
             val serviceIntent = Intent(this, PingService::class.java)
             ContextCompat.startForegroundService(this, serviceIntent)
-            
-            statusText.text = "Status: Running"
-            statusText.setTextColor(android.graphics.Color.parseColor("#4CAF50"))
+
+            updateStatus()
             Toast.makeText(this, "Started in Background", Toast.LENGTH_SHORT).show()
         }
 
@@ -83,7 +82,7 @@ class MainActivity : AppCompatActivity() {
             statusText.setTextColor(android.graphics.Color.parseColor("#FF5252"))
         }
     }
-    
+
     override fun onResume() {
         super.onResume()
         updateStatus()

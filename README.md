@@ -1,1 +1,1 @@
-# pingapp
+# Ping Booster

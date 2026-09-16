@@ -12,5 +12,5 @@ google()
 mavenCentral()
 }
 }
-rootProject.name = "PingKeepAlive"
+rootProject.name = "PingBooster"
 include(":app")
