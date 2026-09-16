@@ -3,10 +3,10 @@ id("com.android.application")
 id("org.jetbrains.kotlin.android")
 }
 android {
-namespace = "com.ping.keepalive"
+namespace = "com.ping.booster"
 compileSdk = 34
 defaultConfig {
-applicationId = "com.ping.keepalive"
+applicationId = "com.ping.booster"
 minSdk = 24
 targetSdk = 34
 versionCode = 1

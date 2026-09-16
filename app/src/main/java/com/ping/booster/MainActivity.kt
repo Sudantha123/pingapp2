@@ -1,4 +1,4 @@
-package com.ping.keepalive
+package com.ping.booster
 
 import android.Manifest
 import android.content.Context
@@ -55,7 +55,7 @@ class MainActivity : AppCompatActivity() {
             // Save Settings
             prefs.edit()
                 .putString("url", url)
-                .putInt("delay", delayStr.toInt())
+                .putInt("delay", delayStr.toIntOrNull()?.coerceAtLeast(5) ?: 5)
                 .apply()
 
             // Start Service
@@ -75,7 +75,7 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun updateStatus() {
-        if (PingService.isRunning) {
+        if (getSharedPreferences("PingPrefs", Context.MODE_PRIVATE).getBoolean("running", false)) {
             statusText.text = "Status: Running"
             statusText.setTextColor(android.graphics.Color.parseColor("#4CAF50"))
         } else {
