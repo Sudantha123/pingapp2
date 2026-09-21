@@ -4,15 +4,15 @@ plugins {
 }
 
 android {
-    namespace = "com.ping.booster"
+    namespace = "com.sudantha.pingbooster"
     compileSdk = 34
 
     defaultConfig {
-        applicationId = "com.ping.booster"
+        applicationId = "com.sudantha.pingbooster"
         minSdk = 24
         targetSdk = 34
-        versionCode = 2
-        versionName = "2.0"
+        versionCode = 3
+        versionName = "3.0"
     }
 
     buildTypes {
@@ -40,5 +40,4 @@ dependencies {
     implementation("androidx.core:core-ktx:1.12.0")
     implementation("androidx.appcompat:appcompat:1.6.1")
     implementation("com.google.android.material:material:1.11.0")
-    implementation("androidx.constraintlayout:constraintlayout:2.1.4")
 }
