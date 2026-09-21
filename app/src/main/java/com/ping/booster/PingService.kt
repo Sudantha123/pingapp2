@@ -14,10 +14,9 @@ import android.os.PowerManager
 import android.os.Process
 import android.service.quicksettings.TileService
 import androidx.core.app.NotificationCompat
-import java.io.IOException
+import java.io.BufferedInputStream
 import java.io.InputStream
 import java.io.OutputStream
-import java.net.Socket
 import java.net.URL
 import javax.net.ssl.SSLSocket
 import javax.net.ssl.SSLSocketFactory
@@ -50,16 +49,16 @@ class PingService : Service() {
 
     private var delayMillis = DEFAULT_DELAY_SECONDS * 1000L
 
-    // Parsed once at service start. The old implementation parsed the URL on every ping.
+    // Parse and allocate the request once when the service starts.
     private var targetHost = ""
     private var targetPort = 443
     private var requestBytes = ByteArray(0)
     private val sslSocketFactory: SSLSocketFactory = SSLSocketFactory.getDefault()
 
-    // Reused for every HTTP response. No per-ping buffer allocation.
-    private val responseBuffer = ByteArray(4096)
+    // Reused for every response; no per-ping buffer allocation.
+    private val responseBuffer = ByteArray(MAX_HEADER_BYTES)
 
-    private var inputStream: InputStream? = null
+    private var inputStream: BufferedInputStream? = null
     private var outputStream: OutputStream? = null
 
     override fun onCreate() {
@@ -124,18 +123,15 @@ class PingService : Service() {
             }
         }
 
-        val hostHeader = if (targetPort == 443) {
-            targetHost
-        } else {
-            "$targetHost:$targetPort"
-        }
+        val hostHeader = if (targetPort == 443) targetHost else "$targetHost:$targetPort"
 
-        requestBytes = "HEAD $path HTTP/1.1\r\n" +
+        requestBytes = (
+            "HEAD $path HTTP/1.1\r\n" +
                 "Host: $hostHeader\r\n" +
                 "Connection: keep-alive\r\n" +
                 "User-Agent: PingBooster/3.0\r\n" +
                 "\r\n"
-            .toByteArray(Charsets.US_ASCII)
+            ).toByteArray(Charsets.US_ASCII)
     }
 
     private fun acquireWakeLock() {
@@ -156,7 +152,7 @@ class PingService : Service() {
             override fun run() {
                 if (!isRunning) return
 
-                // The WakeLock is intentionally retained for the entire service lifetime.
+                // WakeLock is intentionally retained for the whole service lifetime.
                 acquireWakeLock()
                 pingOnce()
 
@@ -170,16 +166,13 @@ class PingService : Service() {
     }
 
     /**
-     * Sends a lightweight HTTP HEAD request.
-     *
-     * The TLS/TCP connection is reused whenever the server keeps HTTP/1.1 alive.
-     * If the peer closes it, the next attempt transparently creates a new socket.
+     * Reuses the same TLS/TCP connection whenever the peer keeps HTTP/1.1 alive.
+     * If the peer closes it or an I/O error occurs, the next ping reconnects.
      */
     private fun pingOnce() {
         try {
             ensureConnection()
 
-            val socket = activeSocket ?: return
             val out = outputStream ?: return
             val input = inputStream ?: return
 
@@ -196,8 +189,11 @@ class PingService : Service() {
 
     private fun ensureConnection() {
         val current = activeSocket
-        if (current != null && !current.isClosed && current.isConnected &&
-            !current.isInputShutdown && !current.isOutputShutdown
+        if (current != null &&
+            !current.isClosed &&
+            current.isConnected &&
+            !current.isInputShutdown &&
+            !current.isOutputShutdown
         ) {
             return
         }
@@ -211,82 +207,65 @@ class PingService : Service() {
 
         activeSocket = socket
         outputStream = socket.outputStream
-        inputStream = socket.inputStream
+        inputStream = BufferedInputStream(socket.inputStream, 1024)
     }
 
     /**
-     * Consumes the complete HTTP header block so that the next request starts
-     * on a clean response boundary. HEAD responses have no response body.
-     *
-     * Returns false when the peer closes the connection or the header is invalid.
+     * Reads exactly through the HTTP header terminator CRLFCRLF.
+     * HEAD responses have no message body, so the connection is ready for
+     * the next request immediately after the header block.
      */
     private fun readResponseHeaders(input: InputStream): Boolean {
         var used = 0
-        var lastByte = -1
-        var previousByte = -1
+        var state = 0
 
-        while (used < MAX_HEADER_BYTES) {
-            val count = input.read(responseBuffer, 0, responseBuffer.size)
-            if (count <= 0) return false
+        while (used < responseBuffer.size) {
+            val value = input.read()
+            if (value < 0) return false
 
-            for (i in 0 until count) {
-                val current = responseBuffer[i].toInt() and 0xFF
+            responseBuffer[used++] = value.toByte()
 
-                if (previousByte == '\r'.code && lastByte == '\n'.code && current == '\r'.code) {
-                    // This branch only handles the final CRLFCRLF sequence after the
-                    // next byte is read. Keep the state machine below simpler instead.
+            when (state) {
+                0 -> if (value == 13) state = 1
+                1 -> state = when (value) {
+                    10 -> 2
+                    13 -> 1
+                    else -> 0
                 }
-
-                // Detect CRLFCRLF using the last four bytes without storing a
-                // growing response. We only need to retain the previous 3 bytes.
-                if (previousByte == '\r'.code && lastByte == '\n'.code && current == '\r'.code) {
-                    val nextIndex = i + 1
-                    if (nextIndex < count && (responseBuffer[nextIndex].toInt() and 0xFF) == '\n'.code) {
-                        return !responseHasConnectionClose(responseBuffer, used + i + 1)
+                2 -> state = if (value == 13) 3 else 0
+                3 -> {
+                    if (value == 10) {
+                        if (containsConnectionClose(used)) {
+                            closeConnection()
+                        }
+                        return true
                     }
+                    state = if (value == 13) 1 else 0
                 }
-
-                previousByte = lastByte
-                lastByte = current
-                used++
-                if (used >= MAX_HEADER_BYTES) return false
             }
         }
 
         return false
     }
 
-    /**
-     * Detects an explicit Connection: close header without allocating a String
-     * for the whole response. If present, the connection is closed after this ping.
-     */
-    private fun responseHasConnectionClose(buffer: ByteArray, endExclusive: Int): Boolean {
-        var start = 0
-        while (start + 18 <= endExclusive) {
-            if ((buffer[start].toInt() and 0xFF) == 'C'.code ||
-                (buffer[start].toInt() and 0xFF) == 'c'.code
-            ) {
-                val remaining = endExclusive - start
-                if (remaining >= 19 &&
-                    asciiEqualsIgnoreCase(buffer, start, "connection: close")
-                ) {
-                    closeConnection()
-                    return true
+    private fun containsConnectionClose(length: Int): Boolean {
+        val needle = "connection: close"
+        if (length < needle.length) return false
+
+        for (start in 0..length - needle.length) {
+            var match = true
+            for (i in needle.indices) {
+                val b = responseBuffer[start + i].toInt() and 0xFF
+                val c = needle[i].code
+                val lower = if (b in 'A'.code..'Z'.code) b + 32 else b
+                if (lower != c) {
+                    match = false
+                    break
                 }
             }
-            start++
+            if (match) return true
         }
         return false
-    }
-
-    private fun asciiEqualsIgnoreCase(buffer: ByteArray, offset: Int, value: String): Boolean {
-        if (offset + value.length > buffer.size) return false
-        for (i in value.indices) {
-            val b = buffer[offset + i].toInt() and 0xFF
-            val c = value[i].code
-            if (b != c && b != (c xor 32)) return false
-        }
-        return true
     }
 
     private fun closeConnection() {
