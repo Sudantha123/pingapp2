@@ -203,6 +203,7 @@ class PingService : Service() {
         val socket = sslSocketFactory.createSocket(targetHost, targetPort) as SSLSocket
         socket.soTimeout = SOCKET_TIMEOUT_MS
         socket.keepAlive = true
+        socket.tcpNoDelay = true
         socket.startHandshake()
 
         activeSocket = socket
