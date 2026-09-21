@@ -1,4 +1,4 @@
-package com.ping.booster
+package com.sudantha.pingbooster
 
 import android.Manifest
 import android.content.Context
@@ -30,16 +30,22 @@ class MainActivity : AppCompatActivity() {
         val btnStart: Button = findViewById(R.id.btnStart)
         val btnStop: Button = findViewById(R.id.btnStop)
 
-        // Load saved settings
         val prefs = getSharedPreferences(PingService.PREFS_NAME, Context.MODE_PRIVATE)
         inputUrl.setText(prefs.getString("url", "https://oneapp.hutch.lk"))
         inputDelay.setText(prefs.getInt("delay", 15).toString())
         updateStatus()
 
-        // Android 13+ Notification Permission
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-            if (ContextCompat.checkSelfPermission(this, Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) {
-                ActivityCompat.requestPermissions(this, arrayOf(Manifest.permission.POST_NOTIFICATIONS), 101)
+            if (ContextCompat.checkSelfPermission(
+                    this,
+                    Manifest.permission.POST_NOTIFICATIONS
+                ) != PackageManager.PERMISSION_GRANTED
+            ) {
+                ActivityCompat.requestPermissions(
+                    this,
+                    arrayOf(Manifest.permission.POST_NOTIFICATIONS),
+                    101
+                )
             }
         }
 
@@ -52,13 +58,17 @@ class MainActivity : AppCompatActivity() {
                 return@setOnClickListener
             }
 
-            // Save Settings
+            val delaySeconds = delayStr.toIntOrNull()
+            if (delaySeconds == null || delaySeconds < 1) {
+                Toast.makeText(this, "Delay must be at least 1 second", Toast.LENGTH_SHORT).show()
+                return@setOnClickListener
+            }
+
             prefs.edit()
                 .putString("url", url)
-                .putInt("delay", delayStr.toInt())
+                .putInt("delay", delaySeconds)
                 .apply()
 
-            // Start Service
             val serviceIntent = Intent(this, PingService::class.java)
             ContextCompat.startForegroundService(this, serviceIntent)
 
