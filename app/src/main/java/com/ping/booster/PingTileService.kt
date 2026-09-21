@@ -1,4 +1,4 @@
-package com.ping.booster
+package com.sudantha.pingbooster
 
 import android.app.PendingIntent
 import android.content.Intent
@@ -8,10 +8,6 @@ import android.service.quicksettings.Tile
 import android.service.quicksettings.TileService
 import androidx.core.content.ContextCompat
 
-/**
- * Control Panel (Quick Settings) tile එක.
- * App එක විවෘත නොකර වහාම START / STOP කළ හැක.
- */
 class PingTileService : TileService() {
 
     override fun onStartListening() {
@@ -34,23 +30,20 @@ class PingTileService : TileService() {
         val intent = Intent(this, PingService::class.java)
         try {
             ContextCompat.startForegroundService(this, intent)
-        } catch (e: Exception) {
-            // Android 14 (targetSdk 34) QS tile දෝෂය: background එකෙන් FGS අවසර නැත.
-            // විසඳුම - තිරයේ නොපෙනෙන trampoline activity එකක් හරහා ආරම්භ කිරීම.
+        } catch (_: Exception) {
             startViaTrampoline()
         }
     }
 
     private fun stopPing() {
-        // නැවැත්වීමට background සීමා බාධා නොවේ - වහාම සියලු සම්පත් මුදා හැරේ
         try {
             stopService(Intent(this, PingService::class.java))
-        } catch (e: Exception) {
+        } catch (_: Exception) {
             try {
                 startService(
                     Intent(this, PingService::class.java).setAction(PingService.ACTION_STOP)
                 )
-            } catch (e2: Exception) {
+            } catch (_: Exception) {
             }
         }
     }
@@ -68,7 +61,9 @@ class PingTileService : TileService() {
         try {
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
                 val pending = PendingIntent.getActivity(
-                    this, 0, intent,
+                    this,
+                    0,
+                    intent,
                     PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
                 )
                 startActivityAndCollapse(pending)
@@ -76,10 +71,10 @@ class PingTileService : TileService() {
                 @Suppress("DEPRECATION")
                 startActivityAndCollapse(intent)
             }
-        } catch (e: Exception) {
+        } catch (_: Exception) {
             try {
                 startActivity(intent)
-            } catch (e2: Exception) {
+            } catch (_: Exception) {
             }
         }
     }
@@ -91,7 +86,7 @@ class PingTileService : TileService() {
             tile.label = getString(R.string.app_name)
             tile.icon = Icon.createWithResource(this, R.drawable.ic_tile)
             tile.updateTile()
-        } catch (e: Exception) {
+        } catch (_: Exception) {
         }
     }
 }
