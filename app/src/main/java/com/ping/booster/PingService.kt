@@ -53,7 +53,7 @@ class PingService : Service() {
     private var targetHost = ""
     private var targetPort = 443
     private var requestBytes = ByteArray(0)
-    private val sslSocketFactory: SSLSocketFactory = SSLSocketFactory.getDefault()
+    private val sslSocketFactory: SSLSocketFactory = SSLSocketFactory.getDefault() as SSLSocketFactory
 
     // Reused for every response; no per-ping buffer allocation.
     private val responseBuffer = ByteArray(MAX_HEADER_BYTES)
