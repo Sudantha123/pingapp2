@@ -1,4 +1,4 @@
-name: Build
+name: Ping Booster v3 Build
 
 on:
   push:
