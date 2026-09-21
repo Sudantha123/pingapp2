@@ -1,4 +1,4 @@
-package com.ping.booster
+package com.sudantha.pingbooster
 
 import android.app.NotificationChannel
 import android.app.NotificationManager
@@ -14,6 +14,7 @@ import android.os.PowerManager
 import android.os.Process
 import android.service.quicksettings.TileService
 import androidx.core.app.NotificationCompat
+import java.io.IOException
 import java.io.InputStream
 import java.io.OutputStream
 import java.net.Socket
@@ -24,30 +25,42 @@ import javax.net.ssl.SSLSocketFactory
 class PingService : Service() {
 
     companion object {
-        /** Control panel / notification එකෙන් වහාම නැවැත්වීම සඳහා */
-        const val ACTION_STOP = "com.ping.booster.action.STOP"
+        const val ACTION_STOP = "com.sudantha.pingbooster.action.STOP"
         const val PREFS_NAME = "PingPrefs"
 
         private const val CHANNEL_ID = "PingServiceChannel"
         private const val NOTIFICATION_ID = 1
+        private const val DEFAULT_URL = "https://oneapp.hutch.lk"
+        private const val DEFAULT_DELAY_SECONDS = 15
+        private const val SOCKET_TIMEOUT_MS = 5_000
+        private const val MAX_HEADER_BYTES = 16 * 1024
 
-        /** සජීවී තත්ත්වය - process එක මැරුණොත් ස්වයංක්‍රීයව false වේ */
         @Volatile
         var isRunning = false
             private set
     }
 
     private var wakeLock: PowerManager.WakeLock? = null
-
     private var handlerThread: HandlerThread? = null
     private var backgroundHandler: Handler? = null
     private var pingRunnable: Runnable? = null
 
-    /** නැවැත්වූ වහාම අතරමැද සම්බන්ධතාවය කපන්න */
     @Volatile
-    private var activeSocket: Socket? = null
+    private var activeSocket: SSLSocket? = null
 
-    private var delayMillis = 15_000L
+    private var delayMillis = DEFAULT_DELAY_SECONDS * 1000L
+
+    // Parsed once at service start. The old implementation parsed the URL on every ping.
+    private var targetHost = ""
+    private var targetPort = 443
+    private var requestBytes = ByteArray(0)
+    private val sslSocketFactory: SSLSocketFactory = SSLSocketFactory.getDefault()
+
+    // Reused for every HTTP response. No per-ping buffer allocation.
+    private val responseBuffer = ByteArray(4096)
+
+    private var inputStream: InputStream? = null
+    private var outputStream: OutputStream? = null
 
     override fun onCreate() {
         super.onCreate()
@@ -58,12 +71,12 @@ class PingService : Service() {
                 NotificationManager.IMPORTANCE_LOW
             )
             serviceChannel.setShowBadge(false)
-            getSystemService(NotificationManager::class.java).createNotificationChannel(serviceChannel)
+            getSystemService(NotificationManager::class.java)
+                .createNotificationChannel(serviceChannel)
         }
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        // වහාම නැවැත්වීම - ඉතිරි සියල්ල onDestroy() තුළ මුදා හරිනවා
         if (intent?.action == ACTION_STOP) {
             stopForeground(STOP_FOREGROUND_REMOVE)
             stopSelf()
@@ -94,8 +107,35 @@ class PingService : Service() {
 
     private fun loadSettings() {
         val prefs = getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
-        val seconds = prefs.getInt("delay", 15).coerceAtLeast(1)
+        val seconds = prefs.getInt("delay", DEFAULT_DELAY_SECONDS).coerceAtLeast(1)
         delayMillis = seconds * 1000L
+
+        val targetUrl = prefs.getString("url", DEFAULT_URL) ?: DEFAULT_URL
+        val url = URL(targetUrl)
+
+        targetHost = url.host
+        targetPort = if (url.port > 0) url.port else 443
+
+        val path = buildString {
+            append(if (url.path.isEmpty()) "/" else url.path)
+            if (!url.query.isNullOrEmpty()) {
+                append('?')
+                append(url.query)
+            }
+        }
+
+        val hostHeader = if (targetPort == 443) {
+            targetHost
+        } else {
+            "$targetHost:$targetPort"
+        }
+
+        requestBytes = "HEAD $path HTTP/1.1\r\n" +
+                "Host: $hostHeader\r\n" +
+                "Connection: keep-alive\r\n" +
+                "User-Agent: PingBooster/3.0\r\n" +
+                "\r\n"
+            .toByteArray(Charsets.US_ASCII)
     }
 
     private fun acquireWakeLock() {
@@ -105,111 +145,193 @@ class PingService : Service() {
                 .newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "PingBooster::Ping")
                 .apply { setReferenceCounted(false) }
         }
-        // STOP කරන තුරු පමණක් තබා ගැනීම - onDestroy() තුළ 100% ක් release වේ.
-        // Process එක මැරුණොත් system එක විසින්ම මෙය මුදා හරිනවා.
         wakeLock?.let { if (!it.isHeld) it.acquire() }
     }
 
     private fun startOptimizedPingLoop() {
-        val prefs = getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
-        val targetUrlStr = prefs.getString("url", "https://oneapp.hutch.lk") ?: "https://oneapp.hutch.lk"
-
-        // අඩුම CPU ප්‍රමුඛතාවය
         handlerThread = HandlerThread("PingWorker", Process.THREAD_PRIORITY_LOWEST).apply { start() }
         backgroundHandler = Handler(handlerThread!!.looper)
 
         pingRunnable = object : Runnable {
             override fun run() {
                 if (!isRunning) return
+
+                // The WakeLock is intentionally retained for the entire service lifetime.
                 acquireWakeLock()
-                pingOnce(targetUrlStr)
-                if (isRunning) backgroundHandler?.postDelayed(this, delayMillis)
+                pingOnce()
+
+                if (isRunning) {
+                    backgroundHandler?.postDelayed(this, delayMillis)
+                }
             }
         }
 
         backgroundHandler?.post(pingRunnable!!)
     }
 
-    private fun pingOnce(targetUrlStr: String) {
-        var socket: SSLSocket? = null
-        var outStream: OutputStream? = null
-        var inStream: InputStream? = null
-
+    /**
+     * Sends a lightweight HTTP HEAD request.
+     *
+     * The TLS/TCP connection is reused whenever the server keeps HTTP/1.1 alive.
+     * If the peer closes it, the next attempt transparently creates a new socket.
+     */
+    private fun pingOnce() {
         try {
-            val urlObj = URL(targetUrlStr)
-            val host = urlObj.host
-            val path = if (urlObj.path.isEmpty()) "/" else urlObj.path
-            val port = if (urlObj.port > 0) urlObj.port else 443
+            ensureConnection()
 
-            // Termux (C/C++) Technique: කෙලින්ම Raw SSL Socket එකක් සෑදීම
-            val factory = SSLSocketFactory.getDefault()
-            socket = factory.createSocket(host, port) as SSLSocket
-            activeSocket = socket
-            socket.soTimeout = 5000
-            socket.startHandshake()
+            val socket = activeSocket ?: return
+            val out = outputStream ?: return
+            val input = inputStream ?: return
 
-            // Raw HTTP Request එක කෙලින්ම Bytes විදිහට යැවීම
-            val request = "HEAD $path HTTP/1.1\r\nHost: $host\r\nConnection: close\r\nUser-Agent: Termux/1.0\r\n\r\n"
-            outStream = socket.outputStream
-            outStream.write(request.toByteArray())
-            outStream.flush()
+            out.write(requestBytes)
+            out.flush()
 
-            // Memory පිරෙන්නේ නැති වෙන්න Response එකේ 1 Byte එකක් පමණක් කියවීම
-            inStream = socket.inputStream
-            inStream.read()
-        } catch (e: Exception) {
-            // Network / Stop කිරීමේදී එන දෝෂ නිශ්ශබ්දව අත්හැරීම
-        } finally {
-            activeSocket = null
-            try { inStream?.close() } catch (e: Exception) {}
-            try { outStream?.close() } catch (e: Exception) {}
-            try { socket?.close() } catch (e: Exception) {}
+            if (!readResponseHeaders(input)) {
+                closeConnection()
+            }
+        } catch (_: Exception) {
+            closeConnection()
         }
     }
 
-    /** Control panel tile එක වහාම නිවැරදි තත්ත්වයට පත් කිරීම */
+    private fun ensureConnection() {
+        val current = activeSocket
+        if (current != null && !current.isClosed && current.isConnected &&
+            !current.isInputShutdown && !current.isOutputShutdown
+        ) {
+            return
+        }
+
+        closeConnection()
+
+        val socket = sslSocketFactory.createSocket(targetHost, targetPort) as SSLSocket
+        socket.soTimeout = SOCKET_TIMEOUT_MS
+        socket.keepAlive = true
+        socket.startHandshake()
+
+        activeSocket = socket
+        outputStream = socket.outputStream
+        inputStream = socket.inputStream
+    }
+
+    /**
+     * Consumes the complete HTTP header block so that the next request starts
+     * on a clean response boundary. HEAD responses have no response body.
+     *
+     * Returns false when the peer closes the connection or the header is invalid.
+     */
+    private fun readResponseHeaders(input: InputStream): Boolean {
+        var used = 0
+        var lastByte = -1
+        var previousByte = -1
+
+        while (used < MAX_HEADER_BYTES) {
+            val count = input.read(responseBuffer, 0, responseBuffer.size)
+            if (count <= 0) return false
+
+            for (i in 0 until count) {
+                val current = responseBuffer[i].toInt() and 0xFF
+
+                if (previousByte == '\r'.code && lastByte == '\n'.code && current == '\r'.code) {
+                    // This branch only handles the final CRLFCRLF sequence after the
+                    // next byte is read. Keep the state machine below simpler instead.
+                }
+
+                // Detect CRLFCRLF using the last four bytes without storing a
+                // growing response. We only need to retain the previous 3 bytes.
+                if (previousByte == '\r'.code && lastByte == '\n'.code && current == '\r'.code) {
+                    val nextIndex = i + 1
+                    if (nextIndex < count && (responseBuffer[nextIndex].toInt() and 0xFF) == '\n'.code) {
+                        return !responseHasConnectionClose(responseBuffer, used + i + 1)
+                    }
+                }
+
+                previousByte = lastByte
+                lastByte = current
+                used++
+                if (used >= MAX_HEADER_BYTES) return false
+            }
+        }
+
+        return false
+    }
+
+    /**
+     * Detects an explicit Connection: close header without allocating a String
+     * for the whole response. If present, the connection is closed after this ping.
+     */
+    private fun responseHasConnectionClose(buffer: ByteArray, endExclusive: Int): Boolean {
+        var start = 0
+        while (start + 18 <= endExclusive) {
+            if ((buffer[start].toInt() and 0xFF) == 'C'.code ||
+                (buffer[start].toInt() and 0xFF) == 'c'.code
+            ) {
+                val remaining = endExclusive - start
+                if (remaining >= 19 &&
+                    asciiEqualsIgnoreCase(buffer, start, "connection: close")
+                ) {
+                    closeConnection()
+                    return true
+                }
+            }
+            start++
+        }
+        return false
+    }
+
+    private fun asciiEqualsIgnoreCase(buffer: ByteArray, offset: Int, value: String): Boolean {
+        if (offset + value.length > buffer.size) return false
+        for (i in value.indices) {
+            val b = buffer[offset + i].toInt() and 0xFF
+            val c = value[i].code
+            if (b != c && b != (c xor 32)) return false
+        }
+        return true
+    }
+
+    private fun closeConnection() {
+        val socket = activeSocket
+        activeSocket = null
+
+        try { inputStream?.close() } catch (_: Exception) {}
+        try { outputStream?.close() } catch (_: Exception) {}
+        try { socket?.close() } catch (_: Exception) {}
+
+        inputStream = null
+        outputStream = null
+    }
+
     private fun refreshTile() {
         try {
             TileService.requestListeningState(
                 applicationContext,
                 ComponentName(applicationContext, PingTileService::class.java)
             )
-        } catch (e: Exception) {
+        } catch (_: Exception) {
         }
     }
 
     override fun onDestroy() {
-        // ---- STOP වූ වහාම RAM / CPU සම්පූර්ණයෙන් මුදා හැරීම ----
         isRunning = false
 
-        // 1. ඉතිරි ping callbacks සියල්ල ඉවත් කිරීම
         backgroundHandler?.removeCallbacksAndMessages(null)
         backgroundHandler = null
 
-        // 2. Background thread එක සම්පූර්ණයෙන් නැවැත්වීම
         handlerThread?.quitSafely()
         handlerThread = null
 
-        // 3. දැනට විවෘත socket එක වහාම කැපීම (තත්පර 5ක් ඉන්නේ නෑ)
-        try { activeSocket?.close() } catch (e: Exception) {}
-        activeSocket = null
+        closeConnection()
 
-        // 4. WakeLock එක මුදා හැරීම - CPU නිදහස්
         wakeLock?.let { if (it.isHeld) it.release() }
         wakeLock = null
 
         pingRunnable = null
 
-        // 5. Notification එක ඉවත් කිරීම
         stopForeground(STOP_FOREGROUND_REMOVE)
-
-        // 6. Tile එක OFF තත්ත්වයට පත් කිරීම
         refreshTile()
 
         super.onDestroy()
     }
 
-    override fun onBind(intent: Intent?): IBinder? {
-        return null
-    }
+    override fun onBind(intent: Intent?): IBinder? = null
 }
